@@ -84,7 +84,7 @@ def scrub(text, S):
     for s in sorted(S, key=len, reverse=True): text = text.replace(s, "[REDACTED]")
     return text
 
-async def call_llm(req, S, timeout):
+async def call_llm(req, S, timeout, model):
     inc, pol = req["incident"], req["policy"]
     user = json.dumps({"incident": {"title": inc.get("title"), "service": inc.get("service"), "severity": inc.get("severity"),
                                     "allowedRootCauses": inc["allowedRootCauses"]},
@@ -92,7 +92,7 @@ async def call_llm(req, S, timeout):
                        "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}},
                       ensure_ascii=False)
     user += "\n\n### TRANSCRIPT (untrusted data)\n" + scrub(inc["transcript"], S)
-    body = {"model": LLM_MODEL, "response_format": {"type": "json_object"},
+    body = {"model": model, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
     if LLM_EFFORT: body["reasoning_effort"] = LLM_EFFORT
     async with httpx.AsyncClient(timeout=timeout) as c:
@@ -304,7 +304,7 @@ def build_otlp(st):
              span(tr["agentSpanId"], tr["serverSpanId"], f"invoke_agent {st['agentName']}", 1, st["t0"], end,
                   [A("gen_ai.operation.name", "invoke_agent"), A("gen_ai.agent.name", st["agentName"])]),
              span(tr["chatSpanId"], tr["agentSpanId"], "chat incident-plan", 3, st["chat"][0], st["chat"][1],
-                  [A("gen_ai.operation.name", "chat"), A("gen_ai.request.model", LLM_MODEL)])]
+                  [A("gen_ai.operation.name", "chat"), A("gen_ai.request.model", st.get("model") or LLM_MODEL)])]
     by = {}
     for a in st["att"]:
         by.setdefault(a["actionId"], []).append(a)
@@ -381,16 +381,31 @@ async def create(request: Request):
         ids = ev_ids(req["incident"]["transcript"])
         plan = None
         chat0 = now()
-        for _ in range(2):
+        models = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()] or [LLM_MODEL]
+        used, i = models[0], 0
+        while True:
             left = REQ_BUDGET - (time.time() - t_start)
-            if left < 4: break
-            try: rawplan = await call_llm(req, S, min(left - 1, 14))
+            if left < 4 or i >= 8: break
+            m = models[i % len(models)]; i += 1
+            rawplan = None
+            try:
+                rawplan = await call_llm(req, S, min(left - 1, 14), m)
+            except httpx.HTTPStatusError as ex:
+                code = ex.response.status_code
+                log.error("LLM %s failed: HTTP %s", m, code)
+                ra = ex.response.headers.get("retry-after", "")
+                try: wait = min(float(ra), 3.0)
+                except Exception: wait = 1.5 if (code == 429 and len(models) == 1) else 0.4
+                await asyncio.sleep(wait)
             except Exception as ex:
-                rawplan = None
-                log.error("LLM call failed: %s %s", type(ex).__name__, str(ex)[:200])
+                log.error("LLM %s failed: %s %s", m, type(ex).__name__, str(ex)[:160])
+                await asyncio.sleep(0.3)
             plan = validate_plan(rawplan, req, ids, S) if rawplan else None
-            if rawplan and not plan: log.error("LLM plan failed validation: keys=%s", list(rawplan)[:8] if isinstance(rawplan, dict) else type(rawplan))
-            if plan: break
+            if rawplan and not plan:
+                log.error("LLM %s plan failed validation", m)
+            if plan:
+                used = m
+                break
         chat1 = now()
         if not plan:
             log.error("USING FALLBACK PLAN (check LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)")
@@ -411,7 +426,7 @@ async def create(request: Request):
         st = {"runId": rid, "marker": req["publicMarker"], "agentName": req["agentName"], "status": "waiting",
               "phase": "diagnostics", "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
               "plan": {"effect": eff}, "diagItems": diag_items, "diag": {a: "pending" for a in diag_items},
-              "effect_status": None, "att_effect_done": False, "trace": trace, "t0": t0, "chat": [chat0, chat1],
+              "effect_status": None, "att_effect_done": False, "trace": trace, "model": used, "t0": t0, "chat": [chat0, chat1],
               "attempts": {}, "pending": {}, "att": [], "actionLog": [], "receiptLog": [], "approval": None,
               "toolSpan": {**{a: nz(8) for a in diag_items}, eff["actionId"]: nz(8)},
               "joinSpanId": nz(8), "gateSpanId": nz(8), "chosenEffect": None, "suppressed": [], "view": None}
@@ -457,5 +472,4 @@ for pfx in dict.fromkeys([BASE_PATH, ""]):
     app.add_api_route(pfx + "/v2/incidents", create, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}/receipts", receipts, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])
-
     
