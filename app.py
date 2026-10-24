@@ -8,7 +8,9 @@ Layers (kept separate on purpose):
   state machine-> process_receipt / new_dispatch (pure, reads+writes stored state)
   trace        -> build_otlp                     (built only from stored dispatches + receipts)
 """
-import os, json, hashlib, re, sqlite3, asyncio, time, uuid, secrets
+import os, json, hashlib, re, sqlite3, asyncio, time, uuid, secrets, logging, sys
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+log = logging.getLogger("incident")
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -383,11 +385,17 @@ async def create(request: Request):
             left = REQ_BUDGET - (time.time() - t_start)
             if left < 4: break
             try: rawplan = await call_llm(req, S, min(left - 1, 14))
-            except Exception: rawplan = None
+            except Exception as ex:
+                rawplan = None
+                log.error("LLM call failed: %s %s", type(ex).__name__, str(ex)[:200])
             plan = validate_plan(rawplan, req, ids, S) if rawplan else None
+            if rawplan and not plan: log.error("LLM plan failed validation: keys=%s", list(rawplan)[:8] if isinstance(rawplan, dict) else type(rawplan))
             if plan: break
         chat1 = now()
-        if not plan: plan = fallback_plan(req, ids)
+        if not plan:
+            log.error("USING FALLBACK PLAN (check LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)")
+            plan = fallback_plan(req, ids)
+        log.info("run planned in %.1fs", time.time() - t_start)
         inc_tp = parse_tp(request.headers.get("traceparent") or req.get("traceparent"))
         tracestate = (request.headers.get("tracestate") or req.get("tracestate")) if inc_tp else None
         trace = {"traceId": inc_tp[0] if inc_tp else nz(16), "parentSpanId": inc_tp[1] if inc_tp else None,
@@ -449,4 +457,5 @@ for pfx in dict.fromkeys([BASE_PATH, ""]):
     app.add_api_route(pfx + "/v2/incidents", create, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}/receipts", receipts, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])
+
     
