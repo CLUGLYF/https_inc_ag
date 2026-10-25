@@ -16,6 +16,7 @@ To configure the service manually, set:
 | `LLM_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `LLM_API_KEY` | Your private Google AI Studio API key |
 | `LLM_MODEL` | `gemini-2.5-flash` |
+| `LLM_MODELS` | Optional ordered fallback list; the Blueprint sets `gemini-2.5-flash,gemini-2.5-flash-lite` |
 
 Start command:
 

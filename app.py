@@ -387,15 +387,33 @@ async def create(request: Request):
         ids = ev_ids(req["incident"]["transcript"])
         plan = None
         chat0 = now()
-        used = LLM_MODEL
-        try:
-            rawplan = await call_llm(req, S, min(REQ_BUDGET, 14), used)
-        except Exception as ex:
-            log.error("LLM %s failed: %s %s", used, type(ex).__name__, str(ex)[:160])
-            rawplan = None
-        plan = validate_plan(rawplan, req, ids, S) if rawplan else None
-        if rawplan and not plan:
-            log.error("LLM %s plan failed validation", used)
+        configured = [m.strip() for m in os.environ.get("LLM_MODELS", "").split(",") if m.strip()]
+        models = list(dict.fromkeys(configured + [LLM_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"]))
+        used = models[0]
+        attempt_limit = min(8, len(models) * 2)
+        last_retry_after = 0.0
+        for attempt in range(attempt_limit):
+            left = REQ_BUDGET - (time.time() - t_start)
+            if left < 2: break
+            model = models[attempt % len(models)]
+            try:
+                rawplan = await call_llm(req, S, min(left - 1, 14), model)
+                candidate = validate_plan(rawplan, req, ids, S) if rawplan else None
+                if candidate:
+                    plan, used = candidate, model
+                    break
+                log.error("LLM %s plan failed validation", model)
+            except httpx.HTTPStatusError as ex:
+                log.error("LLM %s failed: HTTP %s", model, ex.response.status_code)
+                if ex.response.status_code == 429:
+                    try: last_retry_after = min(float(ex.response.headers.get("retry-after", "0")), 3.0)
+                    except (TypeError, ValueError): last_retry_after = 0.0
+            except Exception as ex:
+                log.error("LLM %s failed: %s %s", model, type(ex).__name__, str(ex)[:160])
+            if attempt % len(models) == len(models) - 1 and last_retry_after:
+                left = REQ_BUDGET - (time.time() - t_start)
+                if left > 2: await asyncio.sleep(min(last_retry_after, left - 2))
+                last_retry_after = 0.0
         chat1 = now()
         if not plan:
             log.error("No valid incident plan could be produced (check LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)")
