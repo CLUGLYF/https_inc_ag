@@ -529,4 +529,5 @@ async def get_run(run_id: str, request: Request):
 for pfx in dict.fromkeys([BASE_PATH, ""]):
     app.add_api_route(pfx + "/v2/incidents", create, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}/receipts", receipts, methods=["POST"])
-    app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])v
+    app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])
+      
