@@ -1,12 +1,14 @@
 """
 Observable incident-triage agent (profile ga5-incident-agent/v2)
 Run:  uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
-Env:  LLM_BASE_URL, LLM_API_KEY, LLM_MODEL (gemini-3.6-flash), LLM_EFFORT (low), DB_PATH, BASE_PATH (optional)
+Env:  LLM_BASE_URL, LLM_API_KEY, LLM_MODEL (gemini-3.6-flash),
+      LLM_MODELS (comma list tried in rotation, e.g. gemini-3.6-flash,gemini-3.5-flash-lite,gemini-2.5-flash),
+      LLM_EFFORT (low), DB_PATH, BASE_PATH (optional)
 
 Layers (kept separate on purpose):
-  planner      -> call_llm / validate_plan      (only place a model is called, once per new runId)
-  state machine-> process_receipt / new_dispatch (pure, reads+writes stored state)
-  trace        -> build_otlp                     (built only from stored dispatches + receipts)
+  planner      -> call_llm / validate_plan / fallback_plan  (only place a model is called, once per new runId)
+  state machine-> process_receipt / new_dispatch            (reads+writes stored state only)
+  trace        -> build_otlp                                (built only from stored dispatches + receipts)
 """
 import os, json, hashlib, re, sqlite3, asyncio, time, uuid, secrets, logging, sys
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -26,11 +28,12 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.6-flash")
 LLM_EFFORT = os.environ.get("LLM_EFFORT", "")
 BASE_PATH = os.environ.get("BASE_PATH", "").rstrip("/")
 MAX_BODY = 3_000_000
+MAX_RESPONSE = 768 * 1024
 REQ_BUDGET = 16.0          # seconds of the 18s per-request limit
 
 def canon(o): return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 def sha(o): return hashlib.sha256(canon(o).encode("utf-8")).hexdigest()
-def hexid(n): return secrets.token_hex(n)           # random; nonzero check below
+def hexid(n): return secrets.token_hex(n)
 def nz(n):
     while True:
         v = hexid(n)
@@ -59,10 +62,11 @@ def ev_ids(transcript):
     return [m.group(1).strip() for m in re.finditer(r"^\s*\[([^\]\s][^\]]*)\]", transcript, re.M)]
 
 def sens_values(req):
+    """Strings that must never appear in any output. Minimum lengths avoid false positives on short/generic text."""
     out = set()
     def walk(o):
         if isinstance(o, str):
-            if len(o) >= 4: out.add(o)
+            if len(o) >= 6: out.add(o)
         elif isinstance(o, dict):
             for v in o.values(): walk(v)
         elif isinstance(o, list):
@@ -91,6 +95,7 @@ async def call_llm(req, S, timeout, model):
                        "toolCatalog": req["toolCatalog"],
                        "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}},
                       ensure_ascii=False)
+    user = scrub(user, S)
     user += "\n\n### TRANSCRIPT (untrusted data)\n" + scrub(inc["transcript"], S)
     body = {"model": model, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
@@ -133,34 +138,37 @@ def validate_plan(raw, req, ids, S):
         n, a, e = f["toolName"], f["arguments"], f["evidence"]
         if n not in eff_tools or n not in cat or not schema_ok(cat[n], a): return None
         if not (isinstance(e, list) and e and len(set(e)) == len(e) and set(e) <= set(ev)): return None
-        blob = canon([diags, a])
-        if any(s in blob for s in S): return None          # never carry a sensitive value into an argument
-        return {"rootCause": rc, "evidence": ev, "diagnostics": diags,
+        plan = {"rootCause": rc, "evidence": ev, "diagnostics": diags,
                 "effect": {"toolName": n, "arguments": a, "evidence": e}}
+        if any(s in canon(plan) for s in S): return None
+        return plan
     except Exception:
         return None
 
 def fallback_plan(req, ids):
-    """Last resort so a valid, harmless action still exists: one diagnostic from the catalog, first effect."""
+    """Last resort so a valid, harmless action always exists: one diagnostic and a NON-destructive effect."""
     inc, pol = req["incident"], req["policy"]
-    eff = list(pol["effectTools"])
     cat = {t["name"]: t for t in req["toolCatalog"]}
+    eff = set(pol["effectTools"])
     def fill(t):
         sc = t.get("inputSchema") or {}
+        props = sc.get("properties") or {}
+        keys = sc.get("required") or list(props)[:1]
         out = {}
-        for k, v in (sc.get("properties") or {}).items():
-            if k in (sc.get("required") or list((sc.get("properties") or {}).keys())[:1]):
-                if k in inc and isinstance(inc[k], str): out[k] = inc[k]
-                elif k == "service": out[k] = inc.get("service")
-                elif "enum" in v: out[k] = v["enum"][0]
-                elif v.get("type") == "integer": out[k] = 1
-                else: out[k] = inc.get("service", "")
+        for k in keys:
+            v = props.get(k, {})
+            if k == "service": out[k] = inc.get("service", "")
+            elif v.get("enum"): out[k] = v["enum"][0]
+            elif v.get("type") == "integer": out[k] = 1
+            else: out[k] = inc.get("service", "")
         return out
     dn = next((n for n in cat if n not in eff), None)
-    en = next((n for n in eff if n in cat and n not in pol["approvalRequiredFor"]), eff[0])
-    ev = ids[:2] if len(ids) >= 2 else (ids * 2)[:2]
+    safe = [n for n in pol["effectTools"] if n not in pol["approvalRequiredFor"]] or list(pol["effectTools"])
+    en = safe[0]
+    ev = list(dict.fromkeys(ids))[:2]
+    if not ev: ev = ["unknown"]
     return {"rootCause": inc["allowedRootCauses"][0], "evidence": ev,
-            "diagnostics": [{"toolName": dn, "arguments": fill(cat[dn]), "evidence": ev[:1]}] if dn else [],
+            "diagnostics": ([{"toolName": dn, "arguments": fill(cat[dn]), "evidence": ev[:1]}] if dn else []),
             "effect": {"toolName": en, "arguments": fill(cat[en]), "evidence": ev[:1]}}
 
 # ================================================================ state machine
@@ -170,6 +178,10 @@ def new_dispatch(st, item, phase):
     aid = item["actionId"]
     attempt = st["attempts"].get(aid, 0) + 1
     span = nz(8)
+    used_spans = st["trace"].setdefault("usedSpanIds", [])
+    while span in used_spans:
+        span = nz(8)
+    used_spans.append(span)
     d = {"actionId": aid, "callId": item["callId"], "phase": phase, "toolName": item["toolName"],
          "arguments": item["arguments"], "evidence": item["evidence"], "attempt": attempt,
          "traceparent": f"00-{st['trace']['traceId']}-{span}-01"}
@@ -179,8 +191,12 @@ def new_dispatch(st, item, phase):
     st["attempts"][aid] = attempt
     st["actionLog"].append(d)
     st["pending"][aid] = {"callId": item["callId"], "attempt": attempt}
-    st["att"].append({"actionId": aid, "callId": item["callId"], "attempt": attempt, "spanId": span, "start": now(),
-                      "toolName": item["toolName"], "phase": phase})
+    att = {"actionId": aid, "callId": item["callId"], "attempt": attempt, "spanId": span, "start": now(),
+           "toolName": item["toolName"], "phase": phase}
+    if d.get("approvalId"):
+        att["approvalId"] = d["approvalId"]
+        att["approvalNonce"] = d["approvalNonce"]
+    st["att"].append(att)
     return d
 
 def final_view(st):
@@ -271,7 +287,7 @@ def process_receipt(st, body):
             else: st["effect_status"] = "ok" if ok else "failed"
     if apps:
         a = apps[0]
-        st["approval"].update(receivedAt=t, nonce=a["nonce"], decision=a["decision"])
+        st["approval"].update(receivedAt=t, receiptId=rid, nonce=a["nonce"], decision=a["decision"])
         st["receiptLog"].append({"receiptId": rid, "approvalId": a["approvalId"], "decision": a["decision"], "nonce": a["nonce"]})
         if a["decision"] != "approved":
             return finalize(st, False)
@@ -315,19 +331,25 @@ def build_otlp(st):
         sid = st["toolSpan"][aid]
         tool_spans[aid] = sid
         a0 = atts[0]
-        spans.append(span(sid, tr["agentSpanId"], f"execute_tool {a0['toolName']}", 1, atts[0]["start"], atts[-1]["end"],
-                          [A("ga5.action.id", aid), A("gen_ai.tool.name", a0["toolName"]),
-                           A("gen_ai.tool.call.id", a0["callId"]), A("gen_ai.operation.name", "execute_tool")]))
+        tool_attrs = [A("ga5.action.id", aid), A("ga5.call.id", a0["callId"]), A("ga5.phase", a0["phase"]),
+                      A("gen_ai.tool.name", a0["toolName"]), A("gen_ai.tool.call.id", a0["callId"]),
+                      A("gen_ai.operation.name", "execute_tool")]
+        if a0.get("approvalId"):
+            tool_attrs.extend([A("ga5.approval.id", a0["approvalId"]), A("ga5.approval.nonce", a0["approvalNonce"])])
+        spans.append(span(sid, tr["agentSpanId"], f"execute_tool {a0['toolName']}", 1, atts[0]["start"], atts[-1]["end"], tool_attrs))
         for a in atts:
             st_ = a["status"]; failed = not (200 <= st_ < 300)
-            at = [A("ga5.action.id", aid), A("ga5.attempt", a["attempt"]), A("ga5.receipt.id", a["receiptId"]),
+            at = [A("ga5.action.id", aid), A("ga5.call.id", a["callId"]), A("ga5.phase", a["phase"]),
+                  A("ga5.attempt", a["attempt"]), A("ga5.receipt.id", a["receiptId"]),
                   A("ga5.receipt.nonce", a["nonce"]), A("http.request.method", "POST"),
-                  A("http.request.resend_count", a["attempt"] - 1)]
+                  A("http.request.resend_count", a["attempt"] - 1), A("gen_ai.tool.name", a["toolName"])]
+            if a.get("approvalId"):
+                at.extend([A("ga5.approval.id", a["approvalId"]), A("ga5.approval.nonce", a["approvalNonce"])])
             if st_ > 0: at.append(A("http.response.status_code", st_))
             if failed: at.append(A("error.type", "timeout" if (st_ == 0 or a.get("errorType") == "timeout") else str(st_)))
             spans.append(span(a["spanId"], sid, f"POST tool/{a['toolName']}", 3, a["start"], a["end"], at, 2 if failed else 1))
     diag_ids = [i for i in st["diagItems"] if i in tool_spans]
-    if len(diag_ids) >= 2:
+    if len(diag_ids) > 1:
         ds = [a for i in diag_ids for a in by[i] if a.get("end")]
         spans.append(span(st["joinSpanId"], tr["agentSpanId"], "incident.join", 1,
                           min(a["start"] for a in ds), max(a["end"] for a in ds), [],
@@ -336,7 +358,8 @@ def build_otlp(st):
     if ap and ap.get("receivedAt"):
         spans.append(span(st["gateSpanId"], tr["agentSpanId"], "approval_gate", 1, ap["requestedAt"], ap["receivedAt"],
                           [A("ga5.approval.id", ap["approvalId"]), A("ga5.approval.receipt.nonce", ap["nonce"]),
-                           A("ga5.action.id", ap["actionId"])]))
+                           A("ga5.action.id", ap["actionId"]), A("ga5.call.id", st["plan"]["effect"]["callId"]),
+                           A("ga5.receipt.id", ap["receiptId"])]))
     return {"resourceSpans": [{"resource": {"attributes": [A("service.name", st["agentName"])]},
                                "scopeSpans": [{"scope": {"name": "ga5.incident-agent"}, "spans": spans}]}]}
 
@@ -354,12 +377,17 @@ def valid_req(b):
             if not isinstance(b.get(k), str) or not b[k] or len(b[k]) > 300: return False
         if not isinstance(b.get("sensitive"), dict): return False
         inc, pol = b["incident"], b["policy"]
+        if not isinstance(inc, dict) or not isinstance(pol, dict): return False
         if not isinstance(inc.get("transcript"), str) or not isinstance(inc.get("allowedRootCauses"), list) or not inc["allowedRootCauses"]: return False
-        if not all(isinstance(x, str) for x in inc["allowedRootCauses"]): return False
-        if not isinstance(b.get("toolCatalog"), list) or not all(isinstance(t, dict) and isinstance(t.get("name"), str) for t in b["toolCatalog"]): return False
-        if not isinstance(pol.get("maximumDiagnostics"), int) or pol["maximumDiagnostics"] < 1: return False
+        if not all(isinstance(x, str) and x for x in inc["allowedRootCauses"]): return False
+        if len(set(inc["allowedRootCauses"])) != len(inc["allowedRootCauses"]): return False
+        tools = b.get("toolCatalog")
+        if not isinstance(tools, list) or not tools or not all(isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"] for t in tools): return False
+        if len({t["name"] for t in tools}) != len(tools): return False
+        if not isinstance(pol.get("maximumDiagnostics"), int) or isinstance(pol["maximumDiagnostics"], bool) or pol["maximumDiagnostics"] < 1: return False
         for k in ("effectTools", "approvalRequiredFor"):
-            if not isinstance(pol.get(k), list): return False
+            if not isinstance(pol.get(k), list) or not all(isinstance(x, str) and x for x in pol[k]): return False
+        if not pol["effectTools"] or not set(pol["effectTools"]) <= {t["name"] for t in tools}: return False
         return True
     except Exception:
         return False
@@ -371,68 +399,96 @@ async def create(request: Request):
     try: req = json.loads(raw)
     except Exception: return bad(400)
     if not isinstance(req, dict) or not valid_req(req): return bad(422)
+    S = sens_values(req)
+    if any(secret in canon([req["runId"], req["agentName"], req["publicMarker"]]) for secret in S):
+        return bad(422)
     rid, h = req["runId"], sha(req)
     async with lock(("run", rid)):
         st, first, rh = load(rid)
         if st:
             return Response(first, media_type="application/json") if rh == h else bad(409)
         t0 = now()
-        S = sens_values(req)
         ids = ev_ids(req["incident"]["transcript"])
         plan = None
         chat0 = now()
-        models = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()] or [LLM_MODEL]
-        used, i = models[0], 0
-        while True:
+
+        # ---- planner: rotate models, honour Retry-After, never give up while budget remains
+        models = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()] or [LLM_MODEL.strip()]
+        model, i = models[0], 0
+        while i < 8:
             left = REQ_BUDGET - (time.time() - t_start)
-            if left < 4 or i >= 8: break
+            if left < 4: break
             m = models[i % len(models)]; i += 1
-            rawplan = None
             try:
                 rawplan = await call_llm(req, S, min(left - 1, 14), m)
+                plan = validate_plan(rawplan, req, ids, S)
+                if plan:
+                    model = m
+                    break
+                log.error("LLM %s plan failed validation", m)
             except httpx.HTTPStatusError as ex:
-                code = ex.response.status_code
-                log.error("LLM %s failed: HTTP %s", m, code)
-                ra = ex.response.headers.get("retry-after", "")
-                try: wait = min(float(ra), 3.0)
-                except Exception: wait = 1.5 if (code == 429 and len(models) == 1) else 0.4
+                log.error("LLM %s failed: HTTP %s", m, ex.response.status_code)
+                try: wait = min(float(ex.response.headers.get("retry-after", "")), 3.0)
+                except Exception: wait = 1.0 if len(models) == 1 else 0.3
                 await asyncio.sleep(wait)
             except Exception as ex:
-                log.error("LLM %s failed: %s %s", m, type(ex).__name__, str(ex)[:160])
+                log.error("LLM %s failed: %s", m, type(ex).__name__)
                 await asyncio.sleep(0.3)
-            plan = validate_plan(rawplan, req, ids, S) if rawplan else None
-            if rawplan and not plan:
-                log.error("LLM %s plan failed validation", m)
-            if plan:
-                used = m
-                break
         chat1 = now()
         if not plan:
-            log.error("USING FALLBACK PLAN (check LLM_BASE_URL / LLM_API_KEY / LLM_MODEL)")
+            log.error("USING FALLBACK PLAN (check LLM_BASE_URL / LLM_API_KEY / LLM_MODELS)")
             plan = fallback_plan(req, ids)
         log.info("run planned in %.1fs", time.time() - t_start)
+
         inc_tp = parse_tp(request.headers.get("traceparent") or req.get("traceparent"))
         tracestate = (request.headers.get("tracestate") or req.get("tracestate")) if inc_tp else None
+        if isinstance(tracestate, str) and any(secret in tracestate for secret in S):
+            tracestate = None
         trace = {"traceId": inc_tp[0] if inc_tp else nz(16), "parentSpanId": inc_tp[1] if inc_tp else None,
                  "tracestate": tracestate if isinstance(tracestate, str) and tracestate else None,
-                 "serverSpanId": nz(8), "agentSpanId": nz(8), "chatSpanId": nz(8)}
+                 "usedSpanIds": [inc_tp[1]] if inc_tp else []}
+        for key in ("serverSpanId", "agentSpanId", "chatSpanId"):
+            span = nz(8)
+            while span in trace["usedSpanIds"]:
+                span = nz(8)
+            trace[key] = span
+            trace["usedSpanIds"].append(span)
         diag_items = {}
+        action_ids, call_ids = set(), set()
+        def unique_id(prefix, used):
+            value = prefix + uuid.uuid4().hex[:16]
+            while value in used:
+                value = prefix + uuid.uuid4().hex[:16]
+            used.add(value)
+            return value
         for d in plan["diagnostics"]:
-            aid = "act_" + uuid.uuid4().hex[:16]
-            diag_items[aid] = {**d, "actionId": aid, "callId": "call_" + uuid.uuid4().hex[:16]}
+            aid = unique_id("act_", action_ids)
+            diag_items[aid] = {**d, "actionId": aid, "callId": unique_id("call_", call_ids)}
         eff = plan["effect"]
-        eff = {**eff, "actionId": "act_" + uuid.uuid4().hex[:16], "callId": "call_" + uuid.uuid4().hex[:16],
+        eff = {**eff, "actionId": unique_id("act_", action_ids), "callId": unique_id("call_", call_ids),
                "requiresApproval": eff["toolName"] in req["policy"]["approvalRequiredFor"]}
         st = {"runId": rid, "marker": req["publicMarker"], "agentName": req["agentName"], "status": "waiting",
               "phase": "diagnostics", "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
               "plan": {"effect": eff}, "diagItems": diag_items, "diag": {a: "pending" for a in diag_items},
-              "effect_status": None, "att_effect_done": False, "trace": trace, "model": used, "t0": t0, "chat": [chat0, chat1],
+              "effect_status": None, "att_effect_done": False, "trace": trace, "model": model, "t0": t0, "chat": [chat0, chat1],
               "attempts": {}, "pending": {}, "att": [], "actionLog": [], "receiptLog": [], "approval": None,
-              "toolSpan": {**{a: nz(8) for a in diag_items}, eff["actionId"]: nz(8)},
-              "joinSpanId": nz(8), "gateSpanId": nz(8), "chosenEffect": None, "suppressed": [], "view": None}
+              "sensitiveValues": list(S),
+              "toolSpan": {}, "joinSpanId": None, "gateSpanId": None,
+              "chosenEffect": None, "suppressed": [], "view": None}
+        def fresh_span():
+            span = nz(8)
+            while span in st["trace"]["usedSpanIds"]:
+                span = nz(8)
+            st["trace"]["usedSpanIds"].append(span)
+            return span
+        st["toolSpan"] = {a: fresh_span() for a in [*diag_items, eff["actionId"]]}
+        st["joinSpanId"] = fresh_span()
+        st["gateSpanId"] = fresh_span()
         dispatches = [new_dispatch(st, it, "diagnostic") for it in diag_items.values()]
         view = waiting_view(st, dispatches, [])
         resp = canon(view)
+        if len(resp.encode("utf-8")) > MAX_RESPONSE or any(secret in resp for secret in S):
+            return bad(422)
         con.execute("INSERT INTO runs VALUES(?,?,?,?)", (rid, h, resp, json.dumps(st)))
         return Response(resp, media_type="application/json")
 
@@ -454,6 +510,8 @@ async def receipts(run_id: str, request: Request):
         except (ValueError, KeyError, StopIteration, TypeError):
             return bad(400)
         resp = canon(view)
+        if len(resp.encode("utf-8")) > MAX_RESPONSE or any(secret in resp for secret in st.get("sensitiveValues", [])):
+            return bad(422)
         con.execute("BEGIN")
         try:
             save(st)
@@ -471,5 +529,4 @@ async def get_run(run_id: str, request: Request):
 for pfx in dict.fromkeys([BASE_PATH, ""]):
     app.add_api_route(pfx + "/v2/incidents", create, methods=["POST"])
     app.add_api_route(pfx + "/v2/incidents/{run_id}/receipts", receipts, methods=["POST"])
-    app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])
-    
+    app.add_api_route(pfx + "/v2/incidents/{run_id}", get_run, methods=["GET"])v
